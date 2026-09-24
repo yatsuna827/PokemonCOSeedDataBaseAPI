@@ -1,259 +1,265 @@
-﻿using System;
+using System;
+using System.Collections;
 using System.Collections.Generic;
-using System.Linq;
 using System.IO;
+using System.Linq;
+using System.Text;
 
 namespace PokemonCOSeedDataBaseAPI
 {
-    public abstract class SeedSearcher
+    public sealed class SeedSearcher : IDisposable
     {
-        protected readonly string PATH;
-        public readonly int SpecifiedNumberOfKey = 7;
-        internal SeedSearcher(string path) { PATH = path; }
+        private const int HEADER_SIZE = 32;
+        private const uint MAGIC = 0x42_44_4F_43; // "CODB"
+        private const int VERSION = 1;
 
-        /// <summary>
-        /// 7回分の連続したとにかくバトル(シングル, 最強)の生成結果から, 現在のseed候補を検索します. 引数の長さが7以外の場合は例外を投げます.
-        /// </summary>
-        /// <param name="keys"></param>
-        /// <returns></returns>
-        public abstract IEnumerable<uint> Search((PlayerName playerNameIndex, BattleTeam teamIndex)[] keys);
+        private const int PREFIX_COUNT = 24 * 24 * 24 * 24 * 24;
 
-        public static SeedSearcher CreateFullDBSearcher(string path)
+        private readonly FileStream _stream;
+
+        public SeedSearcher(string path)
         {
-            for (int i = 0; i < 24 * 24; i++)
+            var opened = File.OpenRead(path);
+            try
             {
-                if (!File.Exists(path + $"/{i}.bin"))
-                    throw new Exception($"File could not be found : {path}\\{i}.bin");
+                using var reader = new BinaryReader(opened, Encoding.UTF8, leaveOpen: true);
+
+                if (opened.Length < HEADER_SIZE) throw new InvalidDataException("DB header is truncated.");
+                if (reader.ReadUInt32() != MAGIC) throw new InvalidDataException("Invalid DB magic.");
+                if (reader.ReadUInt32() != VERSION) throw new InvalidDataException("Unsupported DB version.");
+
+                var seedSectionOffset = reader.ReadUInt64();
+                var checksum = reader.ReadUInt64();
+                var riceK = reader.ReadByte();
+
+                if (seedSectionOffset < HEADER_SIZE) throw new InvalidDataException("Invalid DB layout.");
+                if (seedSectionOffset > (ulong)opened.Length) throw new InvalidDataException("Invalid DB layout.");
+                if ((seedSectionOffset - HEADER_SIZE) % 8 != 0) throw new InvalidDataException("Invalid DB layout.");
+                if (((ulong)opened.Length - seedSectionOffset) % 2 != 0) throw new InvalidDataException("Invalid DB layout.");
+                if (riceK > 12) throw new InvalidDataException("Invalid DB layout.");
+
+                opened.Position = HEADER_SIZE;
+
+                var countsLength = (int)(seedSectionOffset - HEADER_SIZE);
+                var counts = reader.ReadBytes(countsLength);
+                if (counts.Length != countsLength) throw new EndOfStreamException();
+
+                const int CHECKPOINT_COUNT = (PREFIX_COUNT + CHECKPOINT_STRIDE - 1) / CHECKPOINT_STRIDE;
+                var checkpoints = new (ulong, long)[CHECKPOINT_COUNT];
+                ulong total = 0;
+                {
+                    var csReader = new CountsSectionReader(riceK, counts);
+                    for (int i = 0; i < PREFIX_COUNT; i++)
+                    {
+                        if (i % CHECKPOINT_STRIDE == 0)
+                        {
+                            var checkpoint = i / CHECKPOINT_STRIDE;
+                            checkpoints[checkpoint] = (total, csReader.BitPosition);
+                        }
+                        total += csReader.ReadCount();
+                    }
+                }
+
+                // validate total
+                {
+                    var entryCount = ((ulong)opened.Length - seedSectionOffset) / 2;
+                    if (total != entryCount)
+                        throw new InvalidDataException("Count total does not match the seed section.");
+                }
+
+                // validate hash
+                {
+                    var hash = new Fnv1A(Fnv1A.OFFSET);
+                    hash.Update(counts, counts.Length);
+                    {
+                        var buffer = new byte[65536];
+                        while (true)
+                        {
+                            var read = opened.Read(buffer, 0, buffer.Length);
+                            if (read == 0) break;
+
+                            hash.Update(buffer, read);
+                        }
+                    }
+
+                    if (hash.Value != checksum) throw new InvalidDataException("DB checksum mismatch.");
+                }
+
+                _stream = opened;
+                _seedSectionOffset = seedSectionOffset;
+                _riceK = riceK;
+                _countsSection = counts;
+                _checkpoints = checkpoints;
             }
-            return new FullDBSearcher(path + "/");
+            catch
+            {
+                opened.Dispose();
+                throw;
+            }
         }
-        public static SeedSearcher CreateLightDBSearcher(string path)
+
+        public SeedSearchResult Search((PlayerName, BattleTeam)[] keys)
         {
-            for (int i = 0; i < 24 * 24; i++)
+            if (keys == null) throw new ArgumentNullException(nameof(keys));
+            if (keys.Length != 5) throw new ArgumentException("Exactly five search keys are required.", nameof(keys));
+            if (!keys.All((_) => _.IsValid())) throw new ArgumentOutOfRangeException(nameof(keys), "A search key is out of range.");
+
+            var codes = keys.Select((_) => _.ToCode()).ToArray();
+            var prefix = codes.Aggregate(0, (acc, cur) => acc * 24 + (int)cur);
+
+            var (first, last) = ReadRange(prefix);
+            if (first == last) return new SeedSearchResult(Enumerable.Empty<uint>());
+
+            var seeds = new ushort[(int)(last - first)];
             {
-                if (!File.Exists(path + $"/{i}.bin"))
-                    throw new Exception($"File could not be found : {path}\\{i}.bin");
+                _stream.Position = (long)(_seedSectionOffset + first * 2);
+                using var reader = new BinaryReader(_stream, Encoding.UTF8, leaveOpen: true);
+                for (int i = 0; i < seeds.Length; i++)
+                    seeds[i] = reader.ReadUInt16();
             }
-            return new LightDBSearcher(path + "/");
+
+            return new SeedSearchResult(SearchSeeds(codes, seeds).ToArray());
+        }
+
+        private readonly ulong _seedSectionOffset;
+        private static IEnumerable<uint> SearchSeeds(uint[] codes, ushort[] seeds)
+        {
+            foreach (var s in seeds)
+            {
+                var h16 = (uint)s << 16;
+                for (uint l16 = 0; l16 <= ushort.MaxValue; l16++)
+                {
+                    var seed = h16 | l16;
+
+                    var matched = codes.All((code) => seed.GenerateTeamChecked(code));
+                    if (matched) yield return seed;
+                }
+            }
+        }
+
+        private readonly byte _riceK;
+
+        // 『各prefixに対応するseedの個数をRice符号化して並べたビット列』をそのままbyte配列として持つ。
+        private readonly byte[] _countsSection;
+        private readonly (ulong Total, long BitPosition)[] _checkpoints;
+        private const int CHECKPOINT_STRIDE = 256;
+        private (ulong first, ulong last) ReadRange(int prefix)
+        {
+            // NOTE: _countsSectionはそこそこサイズがデカいので詰めてbyte配列のまま持っているが、
+            // 符号のビット長はprefixごとに異なるため、そのままではランダムアクセスできない。
+            // そこで、CHECKPOINT_STRIDEごとにcheckpointを記録しておき、そこから線形走査することで、
+            // 任意のprefixに対応するseedの個数を現実的な時間で読み出せるようにしている。
+
+            var checkpointPos = prefix / CHECKPOINT_STRIDE;
+            var (total, pos) = _checkpoints[checkpointPos];
+
+            var csReader = new CountsSectionReader(_riceK, _countsSection, pos);
+
+            var first = total;
+            for (int i = checkpointPos * CHECKPOINT_STRIDE; i < prefix; i++)
+                first += csReader.ReadCount();
+            var last = first + csReader.ReadCount();
+
+            return (first, last);
+        }
+
+        public void Dispose() => _stream.Dispose();
+    }
+
+    public sealed class SeedSearchResult : IEnumerable<uint>
+    {
+        private readonly IEnumerable<uint> _seeds;
+
+        internal SeedSearchResult(IEnumerable<uint> seeds) => _seeds = seeds;
+
+        public SeedSearchResult Search((PlayerName, BattleTeam) key)
+        {
+            if (!key.IsValid()) throw new ArgumentOutOfRangeException(nameof(key), "A search key is out of range.");
+
+            var code = key.ToCode();
+            return new SeedSearchResult(SearchSeeds(_seeds, code));
+        }
+
+        private static IEnumerable<uint> SearchSeeds(IEnumerable<uint> seeds, uint code)
+        {
+            foreach (var current in seeds)
+            {
+                var seed = current;
+                if (seed.GenerateTeamChecked(code)) yield return seed;
+            }
+        }
+
+        public IEnumerator<uint> GetEnumerator() => _seeds.GetEnumerator();
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    sealed class CountsSectionReader
+    {
+        private readonly byte _k;
+
+        private readonly byte[] bytes;
+        private int byteIndex;
+        private int bitIndex;
+
+        public CountsSectionReader(byte k, byte[] bytes, long bitPosition = 0)
+        {
+            _k = k;
+            this.bytes = bytes;
+            byteIndex = (int)(bitPosition / 8);
+            bitIndex = (int)(bitPosition % 8);
+        }
+
+        public long BitPosition => (long)byteIndex * 8 + bitIndex;
+
+        public uint ReadCount()
+        {
+            var quotient = 0u;
+            while (ReadBit() != 0)
+            {
+                if (quotient == (uint.MaxValue >> _k))
+                    throw new InvalidDataException("Rice value is too large.");
+                quotient++;
+            }
+
+            var remainder = 0u;
+            for (int i = 0; i < _k; i++) remainder |= ReadBit() << i;
+            var value = (quotient << _k) | remainder;
+            var count = 16L + (value >> 1 ^ -(value & 1));
+            if (count < 0 || count > uint.MaxValue)
+                throw new InvalidDataException("Invalid count value.");
+
+            return (uint)count;
+        }
+
+        private uint ReadBit()
+        {
+            if (byteIndex >= bytes.Length) throw new InvalidDataException("Counts section is truncated.");
+
+            var bit = (uint)((bytes[byteIndex] >> bitIndex) & 1);
+            if (++bitIndex == 8)
+            {
+                bitIndex = 0;
+                byteIndex++;
+            }
+
+            return bit;
         }
     }
 
-    class FullDBSearcher : SeedSearcher
+    struct Fnv1A
     {
-        internal FullDBSearcher(string path) : base(path) { }
+        public const ulong OFFSET = 0xCBF29CE484222325;
+        private const ulong PRIME = 0x100000001B3;
 
-        public override IEnumerable<uint> Search((PlayerName playerNameIndex, BattleTeam teamIndex)[] keys)
+        public ulong Value { get; set; }
+
+        public Fnv1A(ulong value) => Value = value;
+
+        public void Update(byte[] bytes, int length)
         {
-            if (keys.Length != SpecifiedNumberOfKey) throw new Exception($"Number of search keys must be {SpecifiedNumberOfKey}.");
-
-            var codedKeys = keys.Select(_ => (uint)_.playerNameIndex * 8 + (uint)_.teamIndex).ToArray();
-
-            uint fileKey = codedKeys[5] + codedKeys[6] * 24;
-            uint seedKey = codedKeys[4] + codedKeys[3] * 24 + codedKeys[2] * 24 * 24 + codedKeys[1] * 24 * 24 * 24 + codedKeys[0] * 24 * 24 * 24 * 24;
-
-            var seedList = new List<uint>();
-            string fileName = PATH + $"{fileKey}.bin";
-            try
-            {
-                var fileinfo = new FileInfo(fileName);
-                long filesize = fileinfo.Length / sizeof(uint);
-                long tempIndex = seedKey * filesize / 0x798001;
-                using (var fstream = new FileStream(fileName, FileMode.Open, FileAccess.Read))
-                using (var binaryReader = new BinaryReader(fstream))
-                {
-                    // 前方への探索
-                    int index = (int)Math.Max(0, tempIndex - 1); // tempIndexの位置の探索は後方へ探索するときに通る.
-                    fstream.Seek(index * 4, SeekOrigin.Begin);
-                    while (true)
-                    {
-                        var seed = binaryReader.ReadUInt32();
-                        var key = GenerateSeedKey(ref seed);
-
-                        if (key < seedKey) break;
-                        if (key == seedKey) seedList.Add(AdvanceWithGenerateCode(seed));
-
-                        if (--index < 0) break;
-                        fstream.Seek(index * 4, SeekOrigin.Begin);
-                    }
-
-                    // 後方への探索
-                    fstream.Seek(tempIndex * 4, SeekOrigin.Begin);
-                    while (true)
-                    {
-                        var seed = binaryReader.ReadUInt32();
-                        if (fstream.Position > fstream.Length) break;
-                        if (fstream.Position < 0) break;
-
-                        var key = GenerateSeedKey(ref seed);
-
-                        if (key > seedKey) break;
-                        if (key == seedKey) seedList.Add(AdvanceWithGenerateCode(seed));
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                throw new Exception($"Failed to load file.{Environment.NewLine}{ex.Message}");
-            }
-            return seedList.Distinct();
+            for (int i = 0; i < length; i++)
+                Value = (Value ^ bytes[i]) * PRIME;
         }
 
-        private static uint GenerateSeedKey(ref uint seed)
-        {
-            uint[] codes = new uint[5];
-            for (int k = 0; k < 5; k++)
-            {
-                var enemyTeamIndex = seed.GetRand() & 0x7;
-                uint playerTeamIndex;
-                do { playerTeamIndex = seed.GetRand() & 0x7; } while (enemyTeamIndex == playerTeamIndex);
-
-                var enemyTSV = seed.GetRand() ^ seed.GetRand();
-                foreach(var poke in BattleTeamUltimate.UltimateTeams[enemyTeamIndex])
-                {
-                    seed.Advance5();
-                    while (true)
-                    {
-                        var HID = seed.GetRand();
-                        var LID = seed.GetRand();
-                        var PID = (HID << 16) | LID;
-                        if (GetGender(PID, poke.GenderRatio) != poke.fixedGender) continue;
-                        if (PID % 25 != (uint)poke.fixedNature) continue;
-                        if ((LID ^ HID ^ enemyTSV) < 8) continue;
-
-                        break;
-                    }
-                }
-
-                var playerNameIndex = seed.GetRand(3);
-
-                var playerTSV = seed.GetRand() ^ seed.GetRand();
-                foreach (var poke in BattleTeamUltimate.UltimateTeams[playerTeamIndex])
-                {
-                    seed.Advance5();
-                    while (true)
-                    {
-                        var HID = seed.GetRand();
-                        var LID = seed.GetRand();
-                        var PID = (HID << 16) | LID;
-                        if (GetGender(PID, poke.GenderRatio) != poke.fixedGender) continue;
-                        if (PID % 25 != (uint)poke.fixedNature) continue;
-                        if ((LID ^ HID ^ playerTSV) < 8) continue;
-
-                        break;
-                    }
-                }
-
-                codes[k] = playerNameIndex * 8 + playerTeamIndex;
-            }
-
-            return codes[4] + codes[3] * 24 + codes[2] * 24 * 24 + codes[1] * 24 * 24 * 24 + codes[0] * 24 * 24 * 24 * 24;
-        }
-
-        private static uint AdvanceWithGenerateCode(uint seed)
-        {
-            for (int k = 0; k < 2; k++)
-            {
-                var enemyTeamIndex = seed.GetRand() & 0x7;
-                uint playerTeamIndex;
-                do { playerTeamIndex = seed.GetRand() & 0x7; } while (enemyTeamIndex == playerTeamIndex);
-
-                var enemyTSV = seed.GetRand() ^ seed.GetRand();
-                foreach (var poke in BattleTeamUltimate.UltimateTeams[enemyTeamIndex])
-                {
-                    seed.Advance5();
-                    while (true)
-                    {
-                        var HID = seed.GetRand();
-                        var LID = seed.GetRand();
-                        var PID = (HID << 16) | LID;
-                        if (GetGender(PID, poke.GenderRatio) != poke.fixedGender) continue;
-                        if (PID % 25 != (uint)poke.fixedNature) continue;
-                        if ((LID ^ HID ^ enemyTSV) < 8) continue;
-
-                        break;
-                    }
-                }
-
-
-                seed.Advance();
-
-                var playerTSV = seed.GetRand() ^ seed.GetRand();
-                foreach (var poke in BattleTeamUltimate.UltimateTeams[playerTeamIndex])
-                {
-                    seed.Advance5();
-                    while (true)
-                    {
-                        var HID = seed.GetRand();
-                        var LID = seed.GetRand();
-                        var PID = (HID << 16) | LID;
-                        if (GetGender(PID, poke.GenderRatio) != poke.fixedGender) continue;
-                        if (PID % 25 != (uint)poke.fixedNature) continue;
-                        if ((LID ^ HID ^ playerTSV) < 8) continue;
-
-                        break;
-                    }
-                }
-            }
-
-            return seed;
-        }
-
-        private static Gender GetGender(uint PID, GenderRatio genderRatio)
-        {
-            if (genderRatio == GenderRatio.Genderless) return Gender.Genderless;
-            return (PID & 0xFF) < (uint)genderRatio ? Gender.Female : Gender.Male;
-        }
-    }
-    class LightDBSearcher : SeedSearcher
-    {
-        internal LightDBSearcher(string path) : base(path) { }
-        public new readonly int SpecifiedNumberOfKey = 8;
-        public override IEnumerable<uint> Search((PlayerName playerNameIndex, BattleTeam teamIndex)[] keys)
-        {
-            if (keys.Length != SpecifiedNumberOfKey) throw new Exception($"Number of search keys must be {SpecifiedNumberOfKey}.");
-
-            var codedKeys = keys.Select(_ => (uint)_.playerNameIndex * 8 + (uint)_.teamIndex).ToArray();
-
-            uint fileKey = codedKeys[1] + codedKeys[2] * 24;
-            uint seedKey = codedKeys[3] + codedKeys[4] * 24 + codedKeys[5] * 24 * 24 + codedKeys[6] * 24 * 24 * 24 + codedKeys[7] * 24 * 24 * 24 * 24;
-
-            string fileName = PATH + $"{fileKey}.bin";
-
-            var seedList = new List<uint>();
-            try
-            {
-                var fileinfo = new FileInfo(fileName);
-                var fileLength = fileinfo.Length;
-                var filesize = (int)(fileLength / (2 * sizeof(uint)));
-                using (var fstream = new FileStream(fileName, FileMode.Open, FileAccess.Read))
-                using (var binaryReader = new BinaryReader(fstream))
-                {
-                    int left = -1, right = filesize;
-                    while (right - left > 1)
-                    {
-                        var mid = (left + right) / 2;
-                        fstream.Seek(mid * 8, SeekOrigin.Begin);
-
-                        var key = binaryReader.ReadUInt32();
-                        if (key >= seedKey) right = mid; else left = mid;
-                    }
-                    if (right == left) yield break;
-
-                    fstream.Seek(right * 8, SeekOrigin.Begin);
-                    while (fstream.Position < fileLength)
-                    {
-                        var key = binaryReader.ReadUInt32();
-                        if (key != seedKey) break;
-                        seedList.Add(binaryReader.ReadUInt32());
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                throw new Exception($"Failed to load file.{Environment.NewLine}{ex.Message}");
-            }
-
-            foreach (var seed in seedList) yield return seed;
-        }
     }
 }

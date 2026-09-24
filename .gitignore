@@ -6,11 +6,11 @@
 [Bb]uilds/
 [Dd]ebug/
 [Rr]elease/
+[Bb]in/
 
  
 # ソリューションやプロジェクトファイル
 ExportedObj/
-*.csproj
 *.suo
 *.tmp
 *.user
@@ -27,3 +27,5 @@ Logs/
  
 # VisualStudio
 .vs/
+
+CODB
